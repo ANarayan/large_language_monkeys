@@ -84,21 +84,22 @@ class GenerateScriptConfig(Config):
     model = REQUIRED
     save_dir = REQUIRED
 
-    num_workers = None
+    num_workers = 64
     gpus = None
     vllm_args = None
-    vllm_port = 8000
+    vllm_port = 8080
+    tensor_parallel_size=4
 
     seed = 0
-    limit = None
+    limit = 128
     offset = None
     stride = None
 
     num_few_shot = 2
     max_tokens = 1024
     stop_strings = []
-    num_samples = 2
-    batch_size = 2
+    num_samples = 256
+    batch_size = 8
     top_p = 0.95
     temperature = 0.6
 

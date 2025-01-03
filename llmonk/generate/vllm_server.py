@@ -16,6 +16,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.utils import random_uuid
 from vllm.outputs import RequestOutput, CompletionOutput
 from vllm.inputs import TokensPrompt
+import torch
 
 from dataclasses import fields
 from llmonk.utils import dataclass_to_dict
@@ -24,7 +25,30 @@ TIMEOUT_KEEP_ALIVE = 18000  # seconds.
 TIMEOUT_TO_PREVENT_DEADLOCK = 1  # seconds.
 app = FastAPI()
 engine = None
+import random
 
+
+def get_masked_experts(num_layers=12, experts_per_layer=64, percentage_to_mask=0.10, random_seed=42):
+    # Calculate the number of experts to mask per layer
+    # set random seed
+    random.seed(random_seed)
+
+    num_to_mask = round(experts_per_layer * percentage_to_mask)
+
+    # Initialize the expert_masks dictionary
+    expert_masks = {}
+
+    # Populate the dictionary with random masks for each layer
+    for layer in range(num_layers):
+        # Randomly select experts to mask
+        masked_experts = random.sample(range(experts_per_layer), num_to_mask)
+        # Add the layer and its masked experts to the dictionary
+        expert_masks[f'model.layers.{layer}.mlp'] = masked_experts
+
+    # Print the resulting expert_masks dictionary
+    for layer, masked_experts in expert_masks.items():
+        print(f"{layer}: {masked_experts}")
+    return expert_masks
 
 def make_output(request_output: RequestOutput):
     out = {}
@@ -91,7 +115,7 @@ async def generate(request: Request) -> Response:
         prompt = TokensPrompt(prompt_token_ids=input_ids)
 
     results_generator = engine.generate(
-        inputs=prompt, sampling_params=sampling_params, request_id=request_id
+        prompt, sampling_params=sampling_params, request_id=request_id
     )
 
     # Streaming case
@@ -117,6 +141,62 @@ async def generate(request: Request) -> Response:
     out = make_output(final_output)
     return JSONResponse(out)
 
+def apply_expert_masks(model, expert_masks):
+    """
+    Apply masks to experts in MoE layers by setting gate logits to a large negative value for masked experts.
+
+    Args:
+        model (torch.nn.Module): The model containing MoE layers.
+        expert_masks (dict): A dictionary where keys are layer identifiers and values are lists of expert indices to mask.
+    """
+    LARGE_NEGATIVE = -10000
+
+    for name, module in model.named_modules():
+        if 'layers.' in name and '.mlp' in name:
+            layer_num = name.split('layers.')[1].split('.')[0]
+            layer_key = f'model.layers.{layer_num}.mlp'
+            if layer_key in expert_masks:
+                if hasattr(module, 'gate'):
+                    indices_to_mask = expert_masks[layer_key]
+
+                    def make_gate_forward_hook(indices):
+                        def hook(module, input, output):
+                            router_logits, router_weights = output
+                            # Convert indices to tensor
+                            mask_indices = torch.tensor(indices, device="cuda:0")
+                            # Create a mask of the same shape as router_logits
+                            mask = torch.zeros_like(router_logits)
+                            # Set the masked indices to LARGE_NEGATIVE
+                            mask[:, mask_indices] = LARGE_NEGATIVE
+                            # Return modified tuple
+                            return (router_logits + mask, router_weights)
+                        return hook
+
+                    module.gate.register_forward_hook(make_gate_forward_hook(indices_to_mask))
+                    print(f"Registered mask for {layer_key} experts {indices_to_mask}")
+
+def verify_expert_masks_applied(model, expert_masks):
+    """Verify that forward hooks have been registered for the specified experts in MoE layers."""
+    for name, module in model.named_modules():
+        if 'layers.' in name and '.mlp' in name:
+            layer_num = name.split('layers.')[1].split('.')[0]
+            layer_key = f'model.layers.{layer_num}.mlp'
+            if layer_key in expert_masks:
+                if hasattr(module, 'gate'):
+                    if hasattr(module.gate, '_forward_hooks'):
+                        hooks = module.gate._forward_hooks
+                        if hooks:
+                            print(f"Forward hooks registered on {layer_key}.gate: {hooks}")
+                        else:
+                            print(f"No forward hooks registered on {layer_key}.gate.")
+                    else:
+                        print(f"{layer_key}.gate does not have '_forward_hooks' attribute.")
+                else:
+                    print(f"{layer_key} does not have a 'gate' attribute.")
+            else:
+                print(f"{layer_key} not in expert_masks.")
+
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -127,6 +207,30 @@ if __name__ == "__main__":
 
     engine_args = AsyncEngineArgs.from_cli_args(args)
     engine = AsyncLLMEngine.from_engine_args(engine_args)
+
+    # Print engine structure
+    print("\nEngine attributes:")
+    print(dir(engine))
+
+    print("\nEngine.engine.model_executor.driver_worker.model_runner attributes:")
+    print(dir(engine.engine.model_executor.driver_worker.model_runner))
+
+    print("\nModel attributes:")
+    print(dir(engine.engine.model_executor.driver_worker.model_runner.model))
+
+    # Print model structure
+    print("\nModel named modules:")
+    for name, module in engine.engine.model_executor.driver_worker.model_runner.model.named_modules():
+        print(f"Module: {name}")
+        print(f"Type: {type(module)}")
+
+    # get expert masks
+    expert_masks = get_masked_experts()
+
+    # Apply masks to the correct model path
+    print("Applying expert masks:")
+    apply_expert_masks(engine.engine.model_executor.driver_worker.model_runner.model, expert_masks)
+    verify_expert_masks_applied(engine.engine.model_executor.driver_worker.model_runner.model, expert_masks)
 
     uvicorn.run(
         app,
