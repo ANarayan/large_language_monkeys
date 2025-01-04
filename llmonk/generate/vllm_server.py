@@ -166,28 +166,28 @@ def apply_expert_masks(model, expert_masks):
             layer_num = name.split('layers.')[1].split('.')[0]
             layer_key = f'model.layers.{layer_num}.mlp'
             if layer_key in expert_masks:
-                if hasattr(module, 'gate_proj'):
+                if hasattr(module, 'gate'):
                     indices_to_mask = expert_masks[layer_key]
-
-                    def make_gate_forward_hook(indices):
-                        def hook(module, input, output):
-                            LARGE_NEGATIVE = -10000
-                            output[:, list(indices)] = LARGE_NEGATIVE
-                            return output
-                        return hook
 
                     # def make_gate_forward_hook(indices):
                     #     def hook(module, input, output):
-                    #         router_logits, router_weights = output
-                    #         # Convert indices to tensor
-                    #         mask_indices = torch.tensor(indices, device="cuda:0")
-                    #         # Create a mask of the same shape as router_logits
-                    #         mask = torch.zeros_like(router_logits)
-                    #         # Set the masked indices to LARGE_NEGATIVE
-                    #         mask[:, mask_indices] = LARGE_NEGATIVE
-                    #         # Return modified tuple
-                    #         return (router_logits + mask, router_weights)
+                    #         LARGE_NEGATIVE = -10000
+                    #         output[:, list(indices)] = LARGE_NEGATIVE
+                    #         return output
                     #     return hook
+
+                    def make_gate_forward_hook(indices):
+                        def hook(module, input, output):
+                            router_logits, router_weights = output
+                            # Convert indices to tensor
+                            mask_indices = torch.tensor(indices, device="cuda:0")
+                            # Create a mask of the same shape as router_logits
+                            mask = torch.zeros_like(router_logits)
+                            # Set the masked indices to LARGE_NEGATIVE
+                            mask[:, mask_indices] = LARGE_NEGATIVE
+                            # Return modified tuple
+                            return (router_logits + mask, router_weights)
+                        return hook
 
                     module.gate.register_forward_hook(make_gate_forward_hook(indices_to_mask))
                     print(f"Registered masks for {layer_key} experts {indices_to_mask}")
@@ -199,7 +199,7 @@ def verify_expert_masks_applied(model, expert_masks):
             layer_num = name.split('layers.')[1].split('.')[0]
             layer_key = f'model.layers.{layer_num}.mlp'
             if layer_key in expert_masks:
-                if hasattr(module, 'gate_proj'):
+                if hasattr(module, 'gate'):
                     if hasattr(module.gate, '_forward_hooks'):
                         hooks = module.gate._forward_hooks
                         if hooks:
@@ -226,7 +226,7 @@ def remove_expert_masks(model, expert_masks):
             layer_num = name.split('layers.')[1].split('.')[0]
             layer_key = f'model.layers.{layer_num}.mlp'
             if layer_key in expert_masks:
-                if hasattr(module, 'gate_proj'):
+                if hasattr(module, 'gate'):
                     # Clear all forward hooks
                     module.gate._forward_hooks.clear()
                     print(f"Removed masks for {layer_key}")
