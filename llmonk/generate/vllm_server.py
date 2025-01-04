@@ -31,7 +31,7 @@ import random
 def get_masked_experts(num_layers=12, experts_per_layer=64, percentage_to_mask=0.10, random_seed=42):
     # Calculate the number of experts to mask per layer
     # set random seed
-    random.seed(random_seed)
+    #random.seed(random_seed)
 
     num_to_mask = round(experts_per_layer * percentage_to_mask)
 
@@ -98,6 +98,13 @@ async def generate(request: Request) -> Response:
     - stream: whether to stream the results or not.
     - other fields: the sampling parameters (See `SamplingParams` for details).
     """
+    expert_masks = get_masked_experts()
+
+    # Apply masks to the correct model path
+    print("Applying expert masks:")
+    apply_expert_masks(engine.engine.model_executor.driver_worker.model_runner.model, expert_masks)
+    #verify_expert_masks_applied(engine.engine.model_executor.driver_worker.model_runner.model, expert_masks)
+
     request_dict = await request.json()
     prompt = request_dict.pop("prompt", None)
     input_ids = request_dict.pop("input_ids", None)
@@ -139,6 +146,9 @@ async def generate(request: Request) -> Response:
 
     assert final_output is not None
     out = make_output(final_output)
+
+    # Remove the expert masks
+    remove_expert_masks(engine.engine.model_executor.driver_worker.model_runner.model, expert_masks)
     return JSONResponse(out)
 
 def apply_expert_masks(model, expert_masks):
@@ -156,24 +166,31 @@ def apply_expert_masks(model, expert_masks):
             layer_num = name.split('layers.')[1].split('.')[0]
             layer_key = f'model.layers.{layer_num}.mlp'
             if layer_key in expert_masks:
-                if hasattr(module, 'gate'):
+                if hasattr(module, 'gate_proj'):
                     indices_to_mask = expert_masks[layer_key]
 
                     def make_gate_forward_hook(indices):
                         def hook(module, input, output):
-                            router_logits, router_weights = output
-                            # Convert indices to tensor
-                            mask_indices = torch.tensor(indices, device="cuda:0")
-                            # Create a mask of the same shape as router_logits
-                            mask = torch.zeros_like(router_logits)
-                            # Set the masked indices to LARGE_NEGATIVE
-                            mask[:, mask_indices] = LARGE_NEGATIVE
-                            # Return modified tuple
-                            return (router_logits + mask, router_weights)
+                            LARGE_NEGATIVE = -10000
+                            output[:, list(indices)] = LARGE_NEGATIVE
+                            return output
                         return hook
 
+                    # def make_gate_forward_hook(indices):
+                    #     def hook(module, input, output):
+                    #         router_logits, router_weights = output
+                    #         # Convert indices to tensor
+                    #         mask_indices = torch.tensor(indices, device="cuda:0")
+                    #         # Create a mask of the same shape as router_logits
+                    #         mask = torch.zeros_like(router_logits)
+                    #         # Set the masked indices to LARGE_NEGATIVE
+                    #         mask[:, mask_indices] = LARGE_NEGATIVE
+                    #         # Return modified tuple
+                    #         return (router_logits + mask, router_weights)
+                    #     return hook
+
                     module.gate.register_forward_hook(make_gate_forward_hook(indices_to_mask))
-                    print(f"Registered mask for {layer_key} experts {indices_to_mask}")
+                    print(f"Registered masks for {layer_key} experts {indices_to_mask}")
 
 def verify_expert_masks_applied(model, expert_masks):
     """Verify that forward hooks have been registered for the specified experts in MoE layers."""
@@ -182,19 +199,37 @@ def verify_expert_masks_applied(model, expert_masks):
             layer_num = name.split('layers.')[1].split('.')[0]
             layer_key = f'model.layers.{layer_num}.mlp'
             if layer_key in expert_masks:
-                if hasattr(module, 'gate'):
+                if hasattr(module, 'gate_proj'):
                     if hasattr(module.gate, '_forward_hooks'):
                         hooks = module.gate._forward_hooks
                         if hooks:
-                            print(f"Forward hooks registered on {layer_key}.gate: {hooks}")
+                            print(f"Forward hooks registered on {layer_key}.gate_proj: {hooks}")
                         else:
-                            print(f"No forward hooks registered on {layer_key}.gate.")
+                            print(f"No forward hooks registered on {layer_key}.gate_proj.")
                     else:
                         print(f"{layer_key}.gate does not have '_forward_hooks' attribute.")
                 else:
                     print(f"{layer_key} does not have a 'gate' attribute.")
             else:
                 print(f"{layer_key} not in expert_masks.")
+
+def remove_expert_masks(model, expert_masks):
+    """
+    Remove expert masks by clearing forward hooks from MoE layers.
+
+    Args:
+        model (torch.nn.Module): The model containing MoE layers.
+        expert_masks (dict): A dictionary where keys are layer identifiers and values are lists of expert indices to mask.
+    """
+    for name, module in model.named_modules():
+        if 'layers.' in name and '.mlp' in name:
+            layer_num = name.split('layers.')[1].split('.')[0]
+            layer_key = f'model.layers.{layer_num}.mlp'
+            if layer_key in expert_masks:
+                if hasattr(module, 'gate_proj'):
+                    # Clear all forward hooks
+                    module.gate._forward_hooks.clear()
+                    print(f"Removed masks for {layer_key}")
 
 
 
